@@ -37,12 +37,18 @@ class _DateBuilder {
   int year = 1970,
       month = 1,
       day = 1,
+      dayOfYear = 0,
       hour = 0,
       minute = 0,
       second = 0,
       fractionalSecond = 0;
   bool pm = false;
   bool utc = false;
+
+  /// Whether the century portion of [year] is ambiguous.
+  ///
+  /// Ignored if `year < 0` or `year >= 100`.
+  bool _hasAmbiguousCentury = false;
 
   /// The locale, kept for logging purposes when there's an error.
   final String _locale;
@@ -66,7 +72,6 @@ class _DateBuilder {
   /// bad. Compensate by adjusting the time portion forward. But only do that
   /// when we're explicitly trying to construct a date, which we can tell from
   /// the format.
-
   // We do set it, the analyzer just can't tell.
   // ignore: prefer_final_fields
   var _dateOnly = false;
@@ -80,31 +85,45 @@ class _DateBuilder {
 
   // Functions that exist just to be closurized so we can pass them to a general
   // method.
-  void setYear(x) {
+  void setYear(int x) {
     year = x;
   }
 
-  void setMonth(x) {
+  /// Sets whether [year] should be treated as ambiguous because it lacks a
+  /// century.
+  void setHasAmbiguousCentury(bool isAmbiguous) {
+    _hasAmbiguousCentury = isAmbiguous;
+  }
+
+  void setMonth(int x) {
     month = x;
   }
 
-  void setDay(x) {
+  void setDay(int x) {
     day = x;
   }
 
-  void setHour(x) {
+  void setDayOfYear(int x) {
+    dayOfYear = x;
+  }
+
+  /// If [dayOfYear] has been set, return it, otherwise return [day], indicating
+  /// the day of the month.
+  int get dayOrDayOfYear => dayOfYear == 0 ? day : dayOfYear;
+
+  void setHour(int x) {
     hour = x;
   }
 
-  void setMinute(x) {
+  void setMinute(int x) {
     minute = x;
   }
 
-  void setSecond(x) {
+  void setSecond(int x) {
     second = x;
   }
 
-  void setFractionalSecond(x) {
+  void setFractionalSecond(int x) {
     fractionalSecond = x;
   }
 
@@ -132,12 +151,13 @@ class _DateBuilder {
     // cases.
     var minimumDate = _dateOnly && date.hour == 1 ? 0 : date.hour;
     _verify(hour24, minimumDate, date.hour, 'hour', s, date);
-    if (day > 31) {
+    if (dayOfYear > 0) {
       // We have an ordinal date, compute the corresponding date for the result
       // and compare to that.
       var leapYear = _isLeapYear(date);
       var correspondingDay = _dayOfYear(date.month, date.day, leapYear);
-      _verify(day, correspondingDay, correspondingDay, 'day', s, date);
+      _verify(
+          dayOfYear, correspondingDay, correspondingDay, 'dayOfYear', s, date);
     } else {
       // We have the day of the month, compare directly.
       _verify(day, date.day, date.day, 'day', s, date);
@@ -161,6 +181,22 @@ class _DateBuilder {
     }
   }
 
+  /// Offsets a [DateTime] by a specified number of years.
+  ///
+  /// All other fields of the [DateTime] normally will remain unaffected.  An
+  /// exception is if the resulting [DateTime] otherwise would represent an
+  /// invalid date (e.g. February 29 of a non-leap year).
+  DateTime _offsetYear(DateTime dateTime, int offsetYears) =>
+      _dateTimeConstructor(
+          dateTime.year + offsetYears,
+          dateTime.month,
+          dateTime.day,
+          dateTime.hour,
+          dateTime.minute,
+          dateTime.second,
+          dateTime.millisecond,
+          dateTime.isUtc);
+
   /// Return a date built using our values. If no date portion is set,
   /// use the 'Epoch' of January 1, 1970.
   DateTime asDate({int retries = 3}) {
@@ -168,12 +204,47 @@ class _DateBuilder {
     // can crash the VM, e.g. large month values.
     if (_date != null) return _date;
 
-    if (utc) {
-      _date = _dateTimeConstructor(
-          year, month, day, hour24, minute, second, fractionalSecond, utc);
+    DateTime preliminaryResult;
+    final hasCentury = !_hasAmbiguousCentury || year < 0 || year >= 100;
+    if (hasCentury) {
+      preliminaryResult = _dateTimeConstructor(year, month, dayOrDayOfYear,
+          hour24, minute, second, fractionalSecond, utc);
     } else {
-      var preliminaryResult = _dateTimeConstructor(
-          year, month, day, hour24, minute, second, fractionalSecond, utc);
+      var now = clock.now();
+      if (utc) {
+        now = now.toUtc();
+      }
+
+      const lookBehindYears = 80;
+      var lowerDate = _offsetYear(now, -lookBehindYears);
+      var upperDate = _offsetYear(now, 100 - lookBehindYears);
+      var lowerCentury = (lowerDate.year ~/ 100) * 100;
+      var upperCentury = (upperDate.year ~/ 100) * 100;
+      preliminaryResult = _dateTimeConstructor(upperCentury + year, month,
+          dayOrDayOfYear, hour24, minute, second, fractionalSecond, utc);
+
+      // Our interval must be half-open since there otherwise could be ambiguity
+      // for a date that is exactly 20 years in the future or exactly 80 years
+      // in the past (mod 100).  We'll treat the lower-bound date as the
+      // exclusive bound because:
+      // * It's farther away from the present, and we're less likely to care
+      //   about it.
+      // * By the time this function exits, time will have advanced to favor
+      //   the upper-bound date.
+      //
+      // We don't actually need to check both bounds.
+      if (preliminaryResult.compareTo(upperDate) <= 0) {
+        // Within range.
+        assert(preliminaryResult.compareTo(lowerDate) > 0);
+      } else {
+        preliminaryResult = _dateTimeConstructor(lowerCentury + year, month,
+            dayOrDayOfYear, hour24, minute, second, fractionalSecond, utc);
+      }
+    }
+
+    if (utc && hasCentury) {
+      _date = preliminaryResult;
+    } else {
       _date = _correctForErrors(preliminaryResult, retries);
     }
     return _date;
@@ -236,7 +307,8 @@ class _DateBuilder {
       }
 
       // Trying again didn't work, try to force the offset.
-      var expectedDayOfYear = _dayOfYear(month, day, leapYear);
+      var expectedDayOfYear =
+          dayOfYear == 0 ? _dayOfYear(month, day, leapYear) : dayOfYear;
 
       // If we're _dateOnly, then hours should be zero, but might have been
       // offset to e.g. 11:00pm the previous day. Add that time back in. This
@@ -325,7 +397,7 @@ class _Stream {
 
   /// Find the index of the first element for which [f] returns true.
   /// Advances the stream to that position.
-  int findIndex(Function f) {
+  int findIndex(bool Function(dynamic) f) {
     while (!atEnd()) {
       if (f(next())) return index - 1;
     }
@@ -334,7 +406,7 @@ class _Stream {
 
   /// Find the indexes of all the elements for which [f] returns true.
   /// Leaves the stream positioned at the end.
-  List<dynamic> findIndexes(Function f) {
+  List<dynamic> findIndexes(bool Function(dynamic) f) {
     var results = [];
     while (!atEnd()) {
       if (f(next())) results.add(index - 1);

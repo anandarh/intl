@@ -443,6 +443,11 @@ class _DateFormatPatternField extends _DateFormatField {
     return longestResult;
   }
 
+  void parseYear(_Stream input, _DateBuilder builder) {
+    handleNumericField(input, builder.setYear);
+    builder.setHasAmbiguousCentury(width == 2);
+  }
+
   String formatMonth(DateTime date) {
     switch (width) {
       case 5:
